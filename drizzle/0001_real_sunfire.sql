@@ -1,0 +1,1 @@
+ALTER TABLE `records` ADD `record_type` text DEFAULT '' NOT NULL;

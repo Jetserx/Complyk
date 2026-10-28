@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import {createClient} from '@supabase/supabase-js';
+import {NextRequest} from 'next/server.js';
+import * as api from '../.sites-runtime/route.mjs';
+const db=createClient('https://izjedgmjiivasyigsryh.supabase.co','sb_publishable_fSbb1W5Z7mLOEkMLm09ZrA_Hr9s93Mj',{auth:{persistSession:false,autoRefreshToken:false}});
+const {data,error}=await db.auth.signInWithPassword({email:'complyk-qa-3@example.com',password:process.env.COMPLYK_QA_PASSWORD});assert.ifError(error);
+const company=process.env.COMPLYK_QA_COMPANY;assert.ok(company);
+const request=(method,body)=>new NextRequest('http://complyk.test/api/records?company='+company,{method,headers:{Authorization:'Bearer '+data.session.access_token,'X-Company-ID':company,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
+const r=await api.GET(request('GET'));assert.equal(r.status,200);const records=(await r.json()).items;assert.equal(records.length,7);
+assert.equal((await api.POST(request('POST',{kind:'requirement',recordType:'Permit / licence',title:'Viewer cannot create'}))).status,403);
+assert.equal((await api.PATCH(request('PATCH',{id:records[0].id,status:'open'}))).status,403);
+const direct=await db.from('compliance_records').insert({company_id:company,kind:'requirement',title:'Viewer cannot create'});assert.ok(direct.error);
+const update=await db.from('compliance_records').update({status:'open'}).eq('id',records[0].id).select();assert.ifError(update.error);assert.equal(update.data.length,0);
+console.log('PASS: viewer can read but cannot create or update via API or direct database');
+const refreshToken=data.session.refresh_token;assert.ifError((await db.auth.signOut()).error);
+const revoked=await db.auth.refreshSession({refresh_token:refreshToken});assert.ok(revoked.error);
+console.log('PASS: sign-out revokes the refresh token');

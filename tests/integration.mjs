@@ -1,0 +1,50 @@
+import assert from 'node:assert/strict';
+import {createClient} from '@supabase/supabase-js';
+import {randomUUID} from 'node:crypto';
+import fs from 'node:fs/promises';
+import ts from 'typescript';
+import {NextRequest} from 'next/server.js';
+await fs.mkdir('.sites-runtime',{recursive:true});
+for(const [src,target] of [['lib/supabase-config.ts','supabase-config'],['lib/record-types.ts','record-types'],['app/api/records/route.ts','route']]){
+ const source=(await fs.readFile(src,'utf8')).replaceAll('@/lib/supabase-config','./supabase-config.mjs').replaceAll('@/lib/record-types','./record-types.mjs').replaceAll("'next/server'","'next/server.js'");
+ await fs.writeFile('.sites-runtime/'+target+'.mjs',ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText);
+}
+const handlers=await import('../.sites-runtime/route.mjs');
+const url='https://izjedgmjiivasyigsryh.supabase.co',key='sb_publishable_fSbb1W5Z7mLOEkMLm09ZrA_Hr9s93Mj';
+const password=process.env.COMPLYK_QA_PASSWORD;
+if(!password)throw new Error('COMPLYK_QA_PASSWORD is required for disposable test fixtures.');
+const client=()=>createClient(url,key,{auth:{persistSession:false,autoRefreshToken:false}});
+const a=client(),b=client(),v=client(),anon=client();
+const sessions=await Promise.all([a,b,v].map(async(db,i)=>{const r=await db.auth.signInWithPassword({email:`complyk-qa-${i+1}@example.com`,password});assert.ifError(r.error);return r.data.session;}));
+console.log('PASS: three independent email/password sessions');
+const bad=await anon.auth.signInWithPassword({email:'complyk-qa-1@example.com',password:'Wrong-test-password!'});assert.ok(bad.error);console.log('PASS: wrong password rejected');
+const ca=randomUUID(),cb=randomUUID();
+for(const [db,id,name,session] of [[a,ca,'ComplyK QA Alpha',sessions[0]],[b,cb,'ComplyK QA Beta',sessions[1]]]){const r=await db.from('companies').insert({id,name,created_by:session.user.id});assert.ifError(r.error);const m=await db.from('company_members').select('role').eq('company_id',id).single();assert.ifError(m.error);assert.equal(m.data.role,'owner');}
+console.log('PASS: company creation atomically grants owner membership');
+const foreignCompany=await b.from('companies').select('*').eq('id',ca);assert.ifError(foreignCompany.error);assert.equal(foreignCompany.data.length,0);
+const api=async(session,company,method='GET',body)=>{const r=await handlers[method](new NextRequest('http://complyk.test/api/records?company='+company,{method,headers:{...(session?{Authorization:'Bearer '+session.access_token}:{}),'X-Company-ID':company,'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})}));return {status:r.status,data:await r.json()};};
+assert.equal((await api(null,ca)).status,401);assert.equal((await api({access_token:'invalid'},ca)).status,401);assert.equal((await api(sessions[1],ca)).status,403);
+console.log('PASS: anonymous, invalid-token and foreign-company API access rejected');
+const kinds={requirement:'Permit / licence',employee:'Employee profile',asset:'Crane / lifting equipment',document:'Equipment inspection certificate',inspection:'Equipment inspection',action:'Inspection finding',service:'Equipment inspection'};
+let first;
+for(const [kind,recordType] of Object.entries(kinds)){const r=await api(sessions[0],ca,'POST',{kind,recordType,title:'QA '+kind,dueDate:'2026-11-30',company_id:cb,notes:'Synthetic integration test'});assert.equal(r.status,201,JSON.stringify(r.data));first??=r.data.item.id;}
+const loaded=await api(sessions[0],ca);assert.equal(loaded.status,200);assert.equal(loaded.data.items.length,7);assert.equal(loaded.data.events.length,7);
+console.log('PASS: all seven record categories persist with atomic audit events; forged company body ignored');
+assert.equal((await api(sessions[0],ca,'POST',{kind:'requirement',recordType:'Permit / licence',title:'Invalid date',dueDate:'2026-02-30'})).status,400);
+assert.equal((await api(sessions[0],ca,'PATCH',{id:first,status:'complete'})).status,200);
+const reloaded=await api(sessions[0],ca);assert.equal(reloaded.data.items.find(x=>x.id===first).status,'complete');assert.equal(reloaded.data.events.length,8);
+assert.equal((await api(sessions[1],cb,'PATCH',{id:first,status:'open'})).status,404);
+console.log('PASS: valid status updates persist; invalid dates and foreign record updates rejected');
+const stolenRead=await b.from('compliance_records').select('*').eq('company_id',ca);assert.ifError(stolenRead.error);assert.equal(stolenRead.data.length,0);
+const stolenInsert=await b.from('compliance_records').insert({company_id:ca,kind:'requirement',title:'Forbidden'});assert.ok(stolenInsert.error);
+const stolenUpdate=await b.from('compliance_records').update({status:'open'}).eq('id',first).select();assert.ifError(stolenUpdate.error);assert.equal(stolenUpdate.data.length,0);
+const move=await a.from('compliance_records').update({company_id:cb}).eq('id',first);assert.ok(move.error);
+const audit=await a.from('compliance_activity').insert({company_id:ca,record_id:first,action:'fake',actor:sessions[0].user.id});assert.ok(audit.error);
+const selfGrant=await b.from('company_members').insert({company_id:ca,user_id:sessions[1].user.id,role:'owner'});assert.ok(selfGrant.error);
+assert.ok((await anon.from('compliance_records').select('*')).error);
+console.log('PASS: direct Data API isolation, immutable company IDs, protected audit log, and membership escalation blocked');
+const refresh=await a.auth.refreshSession();assert.ifError(refresh.error);assert.ok(refresh.data.session);assert.equal((await api(refresh.data.session,ca)).status,200);
+console.log('PASS: session refresh retains company access');
+await Promise.all([a,b,v].map(db=>db.auth.signOut()));
+console.log('PASS: sign-out requests accepted');
+console.log('TEST_COMPANY_ALPHA='+ca);
